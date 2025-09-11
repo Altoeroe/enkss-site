@@ -2,10 +2,11 @@
 // NOTE: GitHub Pages cannot list files dynamically
 // So you need to manually add image names here or generate via backend
 const products = [
-  "motor1.jpg",
-  "motor2.jpg",
-  "motor3.jpg"
+  "motor1.png",
+  "motor2.png",
+  "motor3.png"
 ];
+
 
 const container = document.getElementById("product-list");
 
