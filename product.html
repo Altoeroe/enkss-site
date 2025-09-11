@@ -1,0 +1,29 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Product Details</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header>
+    <a href="index.html">⬅ Back to Shop</a>
+  </header>
+
+  <main id="product-details"></main>
+
+  <script>
+    // Get product name from query
+    const params = new URLSearchParams(window.location.search);
+    const product = params.get("product");
+
+    const details = document.getElementById("product-details");
+    details.innerHTML = `
+      <h2>${product}</h2>
+      <img src="images/${product}" alt="${product}">
+      <p>This is a high-quality ${product.split('.')[0]} for your needs.</p>
+    `;
+  </script>
+</body>
+</html>
