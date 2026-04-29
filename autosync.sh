@@ -1,8 +1,14 @@
 #!/bin/bash
-cd ~/Desktop/enkss-site || exit
+cd /home/nightwing/Desktop/enkss-site || exit
 
-while inotifywait -r -e modify,create,delete,move .; do
+while true; do
+    inotifywait -r -e modify,create,delete,move . >/dev/null 2>&1
+    sleep 2
+
     git add .
-    git commit -m "Auto update $(date '+%Y-%m-%d %H:%M:%S')" 2>/dev/null
-    git push
+
+    if ! git diff --cached --quiet; then
+        git commit -m "Update $(date '+%Y-%m-%d %H:%M')" >/dev/null 2>&1
+        git push origin main >/dev/null 2>&1
+    fi
 done
