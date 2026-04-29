@@ -201,7 +201,7 @@ Please share price, stock availability and full details.
 Thank you.`;
 
     window.open(
-      "https://wa.me/918610073734?text=" +
+      "https://wa.me/919443437803?text=" +
         encodeURIComponent(text),
       "_blank"
     );
