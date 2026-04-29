@@ -1,4 +1,5 @@
 // script.js
+// Existing functionality kept + project plan upgrades added
 
 function sendWhatsApp(event) {
   event.preventDefault();
@@ -13,7 +14,6 @@ function sendWhatsApp(event) {
     "Phone: " + encodeURIComponent(phone) + "%0A" +
     "Requirement: " + encodeURIComponent(msg);
 
-  // Replace with your real WhatsApp number:
   const whatsappNumber = "918610073734";
 
   window.open(
@@ -34,7 +34,10 @@ const observer = new IntersectionObserver(
   { threshold: 0.15 }
 );
 
-document.querySelectorAll(".card, .stats div, .contact-box, .hero-text, .hero-image")
+document
+  .querySelectorAll(
+    ".card, .stats div, .contact-box, .hero-text, .hero-image, .mini-card"
+  )
   .forEach((el) => observer.observe(el));
 
 /* Add animation class dynamically */
@@ -44,7 +47,8 @@ style.innerHTML = `
 .stats div,
 .contact-box,
 .hero-text,
-.hero-image{
+.hero-image,
+.mini-card{
   opacity:0;
   transform:translateY(30px);
   transition:all .7s ease;
@@ -67,4 +71,44 @@ window.addEventListener("scroll", () => {
   } else {
     header.style.boxShadow = "none";
   }
+});
+
+/* Floating WhatsApp Button */
+const wa = document.createElement("a");
+wa.href = "https://wa.me/918610073734";
+wa.target = "_blank";
+wa.className = "floating-wa";
+wa.innerHTML = "✆";
+document.body.appendChild(wa);
+
+/* Active nav auto highlight */
+const currentPage = location.pathname.split("/").pop() || "index.html";
+document.querySelectorAll(".menu a").forEach((link) => {
+  const href = link.getAttribute("href");
+  if (href === currentPage) {
+    link.classList.add("active");
+  }
+});
+
+/* Simple counter animation for stats */
+document.querySelectorAll(".stats span").forEach((item) => {
+  const raw = item.textContent.replace(/\D/g, "");
+  const target = parseInt(raw, 10);
+
+  if (!target) return;
+
+  let count = 0;
+  const step = Math.ceil(target / 60);
+
+  const timer = setInterval(() => {
+    count += step;
+
+    if (count >= target) {
+      item.textContent =
+        item.textContent.includes("+") ? target + "+" : target;
+      clearInterval(timer);
+    } else {
+      item.textContent = count;
+    }
+  }, 25);
 });
