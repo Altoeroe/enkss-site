@@ -129,7 +129,7 @@ window.addEventListener("scroll", () => {
 ========================= */
 const wa = document.createElement("a");
 wa.href =
-  "https://wa.me/918610073734?text=" +
+  "https://wa.me/919443437803?text=" +
   encodeURIComponent(
 `Hello ENKS Switchgears,
 
