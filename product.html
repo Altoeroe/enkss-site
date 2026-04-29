@@ -1,29 +1,57 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Product Details</title>
-  <link rel="stylesheet" href="style.css">
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Product Details - ENKSS</title>
+  <link rel="stylesheet" href="style.css" />
 </head>
 <body>
-  <header>
-    <a href="index.html">⬅ Back to Shop</a>
+  <header class="nav glass">
+    <div class="logo">⚡ ENKSS</div>
+    <a href="index.html" class="btn ghost">← Back</a>
   </header>
 
-  <main id="product-details"></main>
+  <section class="wrap two">
+    <div class="panel show">
+      <img id="pimg" src="images/motor1.png" alt="Product" style="width:100%;border-radius:18px;max-height:420px;object-fit:cover;">
+    </div>
+    <div class="panel show">
+      <p class="tag">PREMIUM PRODUCT</p>
+      <h1 id="ptitle">Motor 1</h1>
+      <p id="pdesc">High-quality industrial electrical product built for performance and reliability.</p>
+      <ul>
+        <li>✔ Genuine Product</li>
+        <li>✔ Fast Delivery</li>
+        <li>✔ Bulk Orders Available</li>
+        <li>✔ Warranty Support</li>
+      </ul>
+      <div class="actions">
+        <a class="btn" id="waBtn" target="_blank">WhatsApp Inquiry</a>
+        <a class="btn ghost">Get Quote</a>
+      </div>
+    </div>
+  </section>
+
+  <section class="wrap">
+    <h2>Related Products</h2>
+    <div class="grid">
+      <a class="card show" href="product.html?product=motor1.png">motor1</a>
+      <a class="card show" href="product.html?product=motor2.png">motor2</a>
+      <a class="card show" href="product.html?product=motor3.png">motor3</a>
+    </div>
+  </section>
 
   <script>
-    // Get product name from query
-    const params = new URLSearchParams(window.location.search);
-    const product = params.get("product");
-
-    const details = document.getElementById("product-details");
-    details.innerHTML = `
-      <h2>${product}</h2>
-      <img src="images/${product}" alt="${product}">
-      <p>This is a high-quality ${product.split('.')[0]} for your needs.</p>
-    `;
+    const params = new URLSearchParams(location.search);
+    const product = params.get('product') || 'motor1.png';
+    const name = product.replace('.png','');
+    document.getElementById('ptitle').textContent = name.toUpperCase();
+    document.getElementById('pimg').src = 'images/' + product;
+    document.getElementById('pimg').alt = name;
+    document.getElementById('pdesc').textContent = `Premium ${name} designed for homes, businesses and industrial use.`;
+    const msg = encodeURIComponent('Hello, I am interested in ' + name);
+    document.getElementById('waBtn').href = 'https://wa.me/91XXXXXXXXXX?text=' + msg;
   </script>
 </body>
 </html>
