@@ -1,20 +1,49 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Shop - Enkss Switchgears Online</title>
-  <link rel="stylesheet" href="style.css">
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>ENKSS Premium</title>
+  <link rel="stylesheet" href="style.css" />
 </head>
 <body>
-  <header>
-    <h1>Enkss Switchgears</h1>
+  <header class="nav glass">
+    <div class="logo">⚡ ENKSS</div>
+    <nav>
+      <a href="#products">Products</a>
+      <a href="#about">About</a>
+      <a href="#contact">Contact</a>
+    </nav>
+    <a class="btn">Get Quote</a>
   </header>
-
-  <main>
-    <div id="product-list" class="grid"></div>
-  </main>
-
+  <section class="hero">
+    <div>
+      <p class="tag">TRUST • QUALITY • PERFORMANCE</p>
+      <h1>Powering Every Future</h1>
+      <p class="lead">Premium electrical appliances, switchgears and industrial solutions.</p>
+      <div class="actions"><a class="btn">Shop Now</a><a class="btn ghost">WhatsApp</a></div>
+    </div>
+    <div class="hero-card glass"></div>
+  </section>
+  <section id="products" class="wrap">
+    <h2>Featured Categories</h2>
+    <div class="grid">
+      <div class="card">Switchgears</div><div class="card">Cables</div><div class="card">Lighting</div>
+      <div class="card">Motors</div><div class="card">Solar</div><div class="card">Safety</div>
+    </div>
+  </section>
+  <section id="about" class="wrap two">
+    <div class="panel reveal"><h2>Why ENKSS</h2><p>Trusted quality, bulk supply, fast delivery and support.</p></div>
+    <div class="panel stats reveal"><div><strong data-target="500">0</strong><span>Clients</span></div><div><strong data-target="1200">0</strong><span>Orders</span></div><div><strong data-target="24">0</strong><span>Support</span></div></div>
+  </section>
+  <section id="contact" class="wrap">
+    <div class="panel reveal">
+      <h2>Quick Inquiry</h2>
+      <input placeholder="Name"><input placeholder="Phone"><textarea placeholder="Requirement"></textarea>
+      <button class="btn full">Send Request</button>
+    </div>
+  </section>
+  <a class="wa">✆</a>
   <script src="script.js"></script>
 </body>
 </html>
