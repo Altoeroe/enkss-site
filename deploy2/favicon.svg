@@ -1,0 +1,15 @@
+<!-- favicon.svg -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256">
+  <rect width="256" height="256" rx="42" fill="#ffffff"/>
+  <text
+    x="50%"
+    y="56%"
+    text-anchor="middle"
+    font-size="92"
+    font-family="Arial, Helvetica, sans-serif"
+    font-weight="900"
+    fill="#0b67c2"
+    letter-spacing="2">
+    ENKS
+  </text>
+</svg>
