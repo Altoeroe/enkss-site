@@ -25,7 +25,7 @@ Please share price, availability and details.
 
 Thank you.`;
 
-  const whatsappNumber = "918610073734";
+  const whatsappNumber = "919443437803";
 
   window.open(
     `https://wa.me/${whatsappNumber}?text=${encodeURIComponent(message)}`,
