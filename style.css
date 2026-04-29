@@ -57,4 +57,13 @@ input, textarea {
   background: #111; color: #fff;
 }
 .full { width: 100%; }
+.wa {
+  position: fixed; right: 18px; bottom: 18px;
+  width: 56px; height: 56px; border-radius: 50%;
+  display: grid; place-items: center;
+  background: #25D366; color: #000; text-decoration: none;
+}
+@media (max-width: 800px) {
+  nav { display: none; }
+  .hero, .two { grid-template-columns: 1fr; }
 }
