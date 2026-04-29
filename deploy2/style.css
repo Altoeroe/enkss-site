@@ -453,3 +453,175 @@ textarea{
     display:none;
   }
 }
+
+/* ==== PATCH: ADD BELOW YOUR CURRENT style.css (do not remove old code) ==== */
+
+/* Better logo */
+.logo-wrap{
+  gap:14px !important;
+}
+
+.logo-badge{
+  font-size:30px !important;
+  font-weight:900 !important;
+  padding:10px 16px !important;
+  line-height:1 !important;
+}
+
+.logo-text{
+  font-size:28px !important;
+  font-weight:800 !important;
+  letter-spacing:.3px;
+  color:#ffffff !important;
+  opacity:1 !important;
+}
+
+/* Hero wording layout cleaner */
+.hero h1{
+  font-size:72px !important;
+  line-height:1.03 !important;
+  max-width:700px;
+}
+
+.hero p{
+  font-size:22px !important;
+  line-height:1.65 !important;
+  color:#e0e0e0 !important;
+  max-width:760px;
+}
+
+/* Smooth premium motion */
+@keyframes floatUp{
+  from{
+    opacity:0;
+    transform:translateY(40px);
+  }
+  to{
+    opacity:1;
+    transform:translateY(0);
+  }
+}
+
+.hero-text{
+  animation:floatUp .9s ease forwards;
+}
+
+.hero-image{
+  animation:floatUp 1.1s ease forwards;
+}
+
+.card{
+  transition:
+    transform .35s ease,
+    box-shadow .35s ease,
+    border-color .35s ease !important;
+}
+
+.card:hover{
+  transform:translateY(-10px) scale(1.015) !important;
+}
+
+/* Fix product card button alignment */
+.card{
+  display:flex;
+  flex-direction:column;
+}
+
+.card p{
+  flex-grow:1;
+}
+
+.small-btn{
+  margin-top:auto !important;
+  align-self:flex-start;
+}
+
+/* Better contact section */
+.contact-box{
+  background:#0c0c0c;
+  padding:45px;
+  border-radius:24px;
+  border:1px solid rgba(255,255,255,.08);
+  box-shadow:0 25px 45px rgba(0,0,0,.35);
+}
+
+.contact-box h2{
+  font-size:52px !important;
+  margin-bottom:10px;
+}
+
+.contact-box > p{
+  color:#d5d5d5;
+  margin-bottom:22px;
+  font-size:18px;
+}
+
+.contact-details{
+  margin-top:30px !important;
+  padding-top:22px;
+  border-top:1px solid rgba(255,255,255,.08);
+  display:grid;
+  gap:12px;
+}
+
+.contact-details p{
+  background:#111;
+  padding:14px 16px;
+  border-radius:12px;
+  font-size:17px;
+}
+
+/* Better footer */
+.footer{
+  background:#070707;
+  font-size:16px;
+}
+
+/* Responsive */
+@media(max-width:980px){
+
+  .hero h1{
+    font-size:54px !important;
+  }
+
+  .logo-badge{
+    font-size:22px !important;
+  }
+
+  .logo-text{
+    font-size:22px !important;
+  }
+
+  .contact-box{
+    padding:26px;
+  }
+}
+
+@media(max-width:600px){
+
+  .hero h1{
+    font-size:42px !important;
+  }
+
+  .hero p{
+    font-size:18px !important;
+  }
+
+  .logo-wrap{
+    gap:8px !important;
+  }
+
+  .logo-text{
+    display:block !important;
+    font-size:18px !important;
+  }
+
+  .logo-badge{
+    font-size:18px !important;
+    padding:8px 10px !important;
+  }
+
+  .contact-box h2{
+    font-size:36px !important;
+  }
+}
