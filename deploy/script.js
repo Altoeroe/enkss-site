@@ -1,18 +1,11 @@
-const observer = new IntersectionObserver(entries => {
-  entries.forEach(entry => {
-    if (entry.isIntersecting) entry.target.classList.add('show');
-  });
-}, { threshold: 0.15 });
+function sendWhatsApp(e){
+e.preventDefault();
 
-document.querySelectorAll('.card, .panel').forEach(el => observer.observe(el));
+const name=document.getElementById("name").value;
+const phone=document.getElementById("phone").value;
+const msg=document.getElementById("msg").value;
 
-document.querySelectorAll('[data-target]').forEach(el => {
-  const target = +el.dataset.target;
-  let count = 0;
-  const step = Math.ceil(target / 60);
-  const timer = setInterval(() => {
-    count += step;
-    el.textContent = count >= target ? target : count;
-    if (count >= target) clearInterval(timer);
-  }, 30);
-});
+const text=`Hello ENKS,%0AName: ${name}%0APhone: ${phone}%0ARequirement: ${msg}`;
+
+window.open(`https://wa.me/?text=${text}`,"_blank");
+}
