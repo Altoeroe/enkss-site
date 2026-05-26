@@ -1,0 +1,1268 @@
+Start of the day code.
+#include <endian.h>
+#include <string.h>
+#include "mmosal.h"
+#include "mmwlan.h"
+#include "mmipal.h"
+
+#include "mm_app_common.h"
+
+#include <esp_system.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "driver/gpio.h"
+#include "esp_log.h"
+#include "esp_timer.h"
+#include "mqtt_client.h"
+#include "driver/uart.h"
+
+#define LED_POWER   GPIO_NUM_1
+#define LED_MQTT    GPIO_NUM_2
+
+#define UART_PORT      UART_NUM_1
+#define UART_RX_PIN    44
+#define UART_BUF_SIZE  8192
+
+static bool mqtt_connected = false;
+
+static esp_mqtt_client_handle_t mqtt_client;
+static volatile int64_t mqtt_led_off_time = 0;
+
+static const char *TAG = "HALOW_MQTT";
+
+void led_task(void *pvParameters)
+{
+    while (1)
+    {
+        if (mqtt_led_off_time != 0)
+        {
+            if (esp_timer_get_time() > mqtt_led_off_time)
+            {
+                gpio_set_level(LED_MQTT, 0);
+                mqtt_led_off_time = 0;
+            }
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(5));
+    }
+}
+
+void uart_init(void)
+{
+    uart_config_t uart_config = {
+        .baud_rate = 115200,
+        .data_bits = UART_DATA_8_BITS,
+        .parity    = UART_PARITY_DISABLE,
+        .stop_bits = UART_STOP_BITS_1,
+        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
+        .source_clk = UART_SCLK_DEFAULT,
+    };
+
+    uart_driver_install(
+        UART_PORT,
+        UART_BUF_SIZE,
+        0,
+        0,
+        NULL,
+        0);
+
+    uart_param_config(UART_PORT, &uart_config);
+
+    uart_set_pin(
+      UART_PORT,
+      UART_PIN_NO_CHANGE,
+      UART_RX_PIN,
+      UART_PIN_NO_CHANGE,
+      UART_PIN_NO_CHANGE);
+
+    ESP_LOGI(TAG, "UART Initialized");
+}
+
+static QueueHandle_t mqtt_queue;
+
+typedef struct
+{
+    char data[512];
+} mqtt_msg_t;
+
+void uart_task(void *pvParameters)
+{
+    uint8_t rx_buffer[512];
+
+    static char line_buffer[512];
+    int line_index = 0;
+
+    while (1)
+    {
+        int len = uart_read_bytes(
+            UART_PORT,
+            rx_buffer,
+            sizeof(rx_buffer),
+            pdMS_TO_TICKS(20));
+
+        if (len > 0)
+        {
+            for (int i = 0; i < len; i++)
+            {
+                char ch = rx_buffer[i];
+
+                if (ch == '\n')
+                {
+                    line_buffer[line_index] = '\0';
+
+                    if (line_index > 0)
+                    {
+                        mqtt_msg_t msg;
+
+                        strncpy(msg.data,
+                          line_buffer,
+                          sizeof(msg.data) - 1);
+
+                  msg.data[sizeof(msg.data) - 1] = '\0';
+
+                        static uint32_t dropped = 0;
+
+                        if (xQueueSend(mqtt_queue, &msg, 0) != pdPASS)
+                        {
+                            dropped++;
+
+                            if ((dropped % 100) == 0)
+                            {
+                                ESP_LOGW(TAG, "Dropped %lu packets", dropped);
+                            }
+                        }
+                    }
+
+                    line_index = 0;
+                }
+                else
+                {
+                    if (line_index < sizeof(line_buffer) - 1)
+                    {
+                        line_buffer[line_index++] = ch;
+                    }
+                    else
+                    {
+                        // overflow protection
+                        line_index = 0;
+                    }
+                }
+            }
+        }
+    }
+}
+
+static void mqtt_event_handler(void *handler_args,
+                               esp_event_base_t base,
+                               int32_t event_id,
+                               void *event_data)
+{
+    switch ((esp_mqtt_event_id_t)event_id)
+    {       
+        case MQTT_EVENT_CONNECTED:
+
+          mqtt_connected = true;
+          ESP_LOGI(TAG, "MQTT CONNECTED");
+
+          break;
+
+        case MQTT_EVENT_DISCONNECTED:
+
+          mqtt_connected = false;
+          ESP_LOGI(TAG, "MQTT DISCONNECTED");
+
+          break;
+        
+        case MQTT_EVENT_ERROR:
+
+          ESP_LOGE(TAG, "MQTT ERROR");
+
+          break;
+
+        default:
+            break;
+    }
+}
+
+void mqtt_publish_task(void *pvParameters)
+{
+    mqtt_msg_t msg;
+
+    static char batch_buffer[8192];
+    int batch_len = 0;
+
+    int64_t last_publish = esp_timer_get_time();
+
+    while (1)
+    {
+        if (xQueueReceive(mqtt_queue,
+                          &msg,
+                          pdMS_TO_TICKS(20)))
+        {
+            int msg_len = strlen(msg.data);
+
+            if ((batch_len + msg_len + 2) < sizeof(batch_buffer))
+            {
+                memcpy(&batch_buffer[batch_len],
+                       msg.data,
+                       msg_len);
+
+                batch_len += msg_len;
+
+                batch_buffer[batch_len++] = '\n';
+                batch_buffer[batch_len] = '\0';
+            }
+        }
+
+        int64_t now = esp_timer_get_time();
+
+        if (batch_len > 0 &&
+            (now - last_publish) > 500000)
+        {
+            if (mqtt_connected)
+            {
+                  int msg_id = esp_mqtt_client_publish(
+                  mqtt_client,
+                  "v1/devices/me/telemetry",
+                  batch_buffer,
+                  batch_len,
+                  0,
+                  0);
+
+              if (msg_id >= 0)
+              {
+                  gpio_set_level(LED_MQTT, 1);
+
+                  mqtt_led_off_time =
+                      esp_timer_get_time() + 20000;
+              }
+            }
+
+            batch_len = 0;
+
+            last_publish = now;
+        }
+    }
+}
+
+void mqtt_app_start(void)
+{
+    esp_mqtt_client_config_t mqtt_cfg = {
+        .broker.address.uri = "mqtt://139.59.73.240:1883",
+
+        .credentials.username = "FacMi0c16GH4ynbW0j8P",
+
+        .session.protocol_ver = MQTT_PROTOCOL_V_3_1_1,
+        .session.keepalive = 120,
+
+        .network.timeout_ms = 30000,
+        .network.reconnect_timeout_ms = 5000,
+        .network.disable_auto_reconnect = false,
+
+        .buffer.size = 8192,
+        .buffer.out_size = 8192,
+    };
+
+    mqtt_client = esp_mqtt_client_init(&mqtt_cfg);
+
+    esp_mqtt_client_register_event(
+        mqtt_client,
+        ESP_EVENT_ANY_ID,
+        mqtt_event_handler,
+        NULL);
+
+    esp_mqtt_client_start(mqtt_client);
+
+    ESP_LOGI(TAG, "MQTT Started");
+}
+
+void led_init(void)
+{
+    gpio_config_t io_conf = {
+        .mode = GPIO_MODE_OUTPUT,
+        .pin_bit_mask =
+            (1ULL << LED_POWER) |
+            (1ULL << LED_MQTT),
+    };
+
+    gpio_config(&io_conf);
+
+    // Power LED ON
+    gpio_set_level(LED_POWER, 1);
+
+    // MQTT LED OFF initially
+    gpio_set_level(LED_MQTT, 0);
+}
+
+void app_main(void)
+{
+    printf("HaLow MQTT Gateway\n");
+
+    app_wlan_init();
+    app_wlan_start();
+    
+    led_init();
+    
+    ESP_LOGI(TAG, "Waiting for HaLow network...");
+    
+    vTaskDelay(pdMS_TO_TICKS(15000));
+
+    ESP_LOGI(TAG, "Starting MQTT");
+
+    ESP_LOGI(TAG, "HaLow network ready");
+
+    mqtt_app_start();
+
+    uart_init();
+
+    mqtt_queue = xQueueCreate(
+        120,
+        sizeof(mqtt_msg_t));
+        
+    xTaskCreatePinnedToCore(
+    uart_task,
+    "uart_task",
+    8192,
+    NULL,
+    10,
+    NULL,
+    1);
+
+    xTaskCreatePinnedToCore(
+    mqtt_publish_task,
+    "mqtt_publish_task",
+    8192,
+    NULL,
+    9,
+    NULL,
+    1);
+    
+    xTaskCreatePinnedToCore(
+    led_task,
+    "led_task",
+    2048,
+    NULL,
+    1,
+    NULL,
+    1);
+}
+
+
+
+
+working code with 800ms delay for each data but only ET shows-> 
+#include <endian.h>
+#include <string.h>
+#include "mmosal.h"
+#include "mmwlan.h"
+#include "mmipal.h"
+
+#include "mm_app_common.h"
+
+#include <esp_system.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "driver/gpio.h"
+#include "esp_log.h"
+#include "esp_timer.h"
+#include "mqtt_client.h"
+#include "driver/uart.h"
+
+#define UART_PORT      UART_NUM_1
+#define UART_RX_PIN    44
+#define UART_BUF_SIZE  8192
+
+static bool mqtt_connected = false;
+
+static esp_mqtt_client_handle_t mqtt_client;
+
+static const char *TAG = "HALOW_MQTT";
+
+static char latest_uart_data[768];
+static volatile bool uart_data_available = false;
+
+static SemaphoreHandle_t uart_mutex;
+
+void uart_init(void)
+{
+    uart_config_t uart_config = {
+        .baud_rate = 115200,
+        .data_bits = UART_DATA_8_BITS,
+        .parity    = UART_PARITY_DISABLE,
+        .stop_bits = UART_STOP_BITS_1,
+        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
+        .source_clk = UART_SCLK_DEFAULT,
+    };
+
+    uart_driver_install(
+        UART_PORT,
+        UART_BUF_SIZE,
+        0,
+        0,
+        NULL,
+        0);
+
+    uart_param_config(UART_PORT, &uart_config);
+
+    uart_set_pin(
+      UART_PORT,
+      UART_PIN_NO_CHANGE,
+      UART_RX_PIN,
+      UART_PIN_NO_CHANGE,
+      UART_PIN_NO_CHANGE);
+
+    ESP_LOGI(TAG, "UART Initialized");
+}
+
+void uart_task(void *pvParameters)
+{
+    uint8_t rx_buffer[512];
+
+    static char line_buffer[768];
+    int line_index = 0;
+    memset(line_buffer, 0, sizeof(line_buffer));
+
+    while (1)
+    {
+        int len = uart_read_bytes(
+            UART_PORT,
+            rx_buffer,
+            sizeof(rx_buffer),
+            pdMS_TO_TICKS(20));
+
+        if (len > 0)
+        {
+            for (int i = 0; i < len; i++)
+            {
+                char ch = rx_buffer[i];
+
+                if (ch == '\r')
+                    continue;
+
+                if (ch == '\n')
+                {
+                    line_buffer[line_index] = '\0';
+
+                    if (line_index > 0)
+                    {
+                        xSemaphoreTake(uart_mutex, portMAX_DELAY);
+
+                        strncpy(
+                            latest_uart_data,
+                            line_buffer,
+                            sizeof(latest_uart_data) - 1);
+
+                        latest_uart_data[sizeof(latest_uart_data) - 1] = '\0';
+
+                        uart_data_available = true;
+
+                        xSemaphoreGive(uart_mutex);
+                    }
+
+                    line_index = 0;
+                }
+                else
+                {
+                    if (line_index < sizeof(line_buffer) - 1)
+                    {
+                        line_buffer[line_index++] = ch;
+                    }
+                    else
+                    {
+                        // overflow reset
+                        line_index = 0;
+                    }
+                }
+            }
+        }
+    }
+}
+
+static void mqtt_event_handler(void *handler_args,
+                               esp_event_base_t base,
+                               int32_t event_id,
+                               void *event_data)
+{
+    switch ((esp_mqtt_event_id_t)event_id)
+    {       
+        case MQTT_EVENT_CONNECTED:
+
+          mqtt_connected = true;
+          ESP_LOGI(TAG, "MQTT CONNECTED");
+          break;
+
+        case MQTT_EVENT_DISCONNECTED:
+
+          mqtt_connected = false;
+          ESP_LOGW(TAG, "MQTT DISCONNECTED");
+          break;
+          
+        case MQTT_EVENT_PUBLISHED:
+
+          ESP_LOGI(TAG, "MQTT ACK RECEIVED");
+          break;     
+    
+        case MQTT_EVENT_ERROR:
+
+          ESP_LOGE(TAG, "MQTT ERROR");
+          break;
+
+        default:
+            break;
+    }
+}
+
+void mqtt_publish_task(void *pvParameters)
+{
+    char publish_buffer[768];
+
+    while (1)
+    {
+        vTaskDelay(pdMS_TO_TICKS(800));
+
+        if (!mqtt_connected)
+        {
+            continue;
+        }
+
+        if (!uart_data_available)
+        {
+            continue;
+        }
+
+        xSemaphoreTake(uart_mutex, portMAX_DELAY);
+
+        strncpy(
+            publish_buffer,
+            latest_uart_data,
+            sizeof(publish_buffer) - 1);
+
+        publish_buffer[sizeof(publish_buffer) - 1] = '\0';
+
+        xSemaphoreGive(uart_mutex);
+
+        int msg_id = esp_mqtt_client_publish(
+          mqtt_client,
+          "v1/devices/me/telemetry",
+          publish_buffer,
+          0,
+          0,
+          0);
+
+        if (msg_id >= 0)
+        {
+            ESP_LOGI(TAG, "Published: %s", publish_buffer);
+        }
+        else
+        {
+            ESP_LOGE(TAG, "Publish failed");
+        }
+    }
+}
+
+void mqtt_app_start(void)
+{
+    esp_mqtt_client_config_t mqtt_cfg = {
+        .broker.address.uri = "mqtt://139.59.73.240:1883",
+
+        .credentials.username = "FacMi0c16GH4ynbW0j8P",
+
+        .session.protocol_ver = MQTT_PROTOCOL_V_3_1_1,
+        .session.keepalive = 15,
+        .session.disable_clean_session = true,
+
+        .network.timeout_ms = 5000,
+        .network.reconnect_timeout_ms = 1000,
+        .network.disable_auto_reconnect = false,
+
+        .buffer.size = 4096,
+        .buffer.out_size = 4096,
+    };
+
+    mqtt_client = esp_mqtt_client_init(&mqtt_cfg);
+
+    esp_mqtt_client_register_event(
+        mqtt_client,
+        ESP_EVENT_ANY_ID,
+        mqtt_event_handler,
+        NULL);
+
+    esp_mqtt_client_start(mqtt_client);
+
+    ESP_LOGI(TAG, "MQTT Started");
+}
+
+void app_main(void)
+{
+    printf("HaLow MQTT Gateway\n");
+
+    app_wlan_init();
+    app_wlan_start();
+    
+    ESP_LOGI(TAG, "Waiting for HaLow network...");
+    
+    vTaskDelay(pdMS_TO_TICKS(25000));
+
+    mqtt_app_start();
+
+    uart_init();
+    uart_mutex = xSemaphoreCreateMutex();
+        
+    xTaskCreatePinnedToCore(
+    uart_task,
+    "uart_task",
+    8192,
+    NULL,
+    10,
+    NULL,
+    1);
+
+    xTaskCreatePinnedToCore(
+    mqtt_publish_task,
+    "mqtt_publish_task",
+    8192,
+    NULL,
+    9,
+    NULL,
+    1);
+}
+
+
+another code that works but more yet stable im working
+
+
+#include <endian.h>
+#include <string.h>
+#include "mmosal.h"
+#include "mmwlan.h"
+#include "mmipal.h"
+
+#include "mm_app_common.h"
+
+#include <esp_system.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "driver/gpio.h"
+#include "esp_log.h"
+#include "esp_timer.h"
+#include "mqtt_client.h"
+#include "driver/uart.h"
+
+#define UART_PORT      UART_NUM_1
+#define UART_RX_PIN    44
+#define UART_BUF_SIZE  8192
+
+static bool mqtt_connected = false;
+
+static esp_mqtt_client_handle_t mqtt_client;
+
+static const char *TAG = "HALOW_MQTT";
+
+static QueueHandle_t mqtt_queue;
+
+typedef struct
+{
+    char data[768];
+} mqtt_msg_t;
+
+void uart_init(void)
+{
+    uart_config_t uart_config = {
+        .baud_rate = 115200,
+        .data_bits = UART_DATA_8_BITS,
+        .parity    = UART_PARITY_DISABLE,
+        .stop_bits = UART_STOP_BITS_1,
+        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
+        .source_clk = UART_SCLK_DEFAULT,
+    };
+
+    uart_driver_install(
+        UART_PORT,
+        UART_BUF_SIZE,
+        0,
+        0,
+        NULL,
+        0);
+
+    uart_param_config(UART_PORT, &uart_config);
+
+    uart_set_pin(
+      UART_PORT,
+      UART_PIN_NO_CHANGE,
+      UART_RX_PIN,
+      UART_PIN_NO_CHANGE,
+      UART_PIN_NO_CHANGE);
+
+    ESP_LOGI(TAG, "UART Initialized");
+}
+
+void uart_task(void *pvParameters)
+{
+    uint8_t rx_buffer[512];
+
+    static char line_buffer[768];
+    int line_index = 0;
+    memset(line_buffer, 0, sizeof(line_buffer));
+
+    while (1)
+    {
+        int len = uart_read_bytes(
+            UART_PORT,
+            rx_buffer,
+            sizeof(rx_buffer),
+            pdMS_TO_TICKS(20));
+
+        if (len > 0)
+        {
+            for (int i = 0; i < len; i++)
+            {
+                char ch = rx_buffer[i];
+
+                if (ch == '\r')
+                    continue;
+
+                if (ch == '\n')
+                {
+                    line_buffer[line_index] = '\0';
+
+                    if (line_index > 0)
+                    {
+                      mqtt_msg_t msg;
+
+                      strncpy(
+                          msg.data,
+                          line_buffer,
+                          sizeof(msg.data) - 1);
+
+                      msg.data[sizeof(msg.data) - 1] = '\0';
+
+                      if (xQueueSend(mqtt_queue, &msg, 0) != pdTRUE)
+                      {
+                          ESP_LOGW(TAG, "Queue full, dropping packet");
+                      }
+                    }
+
+                    line_index = 0;
+                }
+                else
+                {
+                    if (line_index < sizeof(line_buffer) - 1)
+                    {
+                        line_buffer[line_index++] = ch;
+                    }
+                    else
+                    {
+                        // overflow reset
+                        line_index = 0;
+                    }
+                }
+            }
+        }
+    }
+}
+
+static void mqtt_event_handler(void *handler_args,
+                               esp_event_base_t base,
+                               int32_t event_id,
+                               void *event_data)
+{
+    switch ((esp_mqtt_event_id_t)event_id)
+    {       
+        case MQTT_EVENT_CONNECTED:
+
+          mqtt_connected = true;
+          ESP_LOGI(TAG, "MQTT CONNECTED");
+          break;
+
+        case MQTT_EVENT_DISCONNECTED:
+
+          mqtt_connected = false;
+          ESP_LOGW(TAG, "MQTT DISCONNECTED");
+          break;
+          
+        case MQTT_EVENT_ERROR:
+
+          ESP_LOGE(TAG, "MQTT ERROR");
+          break;
+
+        default:
+            break;
+    }
+}
+
+void mqtt_publish_task(void *pvParameters)
+{
+    mqtt_msg_t msg;
+
+    while (1)
+    {
+        if (!mqtt_connected)
+        {
+            vTaskDelay(pdMS_TO_TICKS(100));
+            continue;
+        }
+
+        if (xQueueReceive(
+                mqtt_queue,
+                &msg,
+                pdMS_TO_TICKS(100)))
+        {
+            int msg_id = esp_mqtt_client_publish(
+                mqtt_client,
+                "v1/devices/me/telemetry",
+                msg.data,
+                0,
+                0,
+                0);
+
+            if (msg_id >= 0)
+            {
+                ESP_LOGI(TAG, "Published");
+            }
+            else
+            {
+                ESP_LOGE(TAG, "Publish failed");
+            }
+
+            vTaskDelay(pdMS_TO_TICKS(100));
+        }
+    }
+}
+
+void mqtt_app_start(void)
+{
+    esp_mqtt_client_config_t mqtt_cfg = {
+        .broker.address.uri = "mqtt://139.59.73.240:1883",
+
+        .credentials.username = "FacMi0c16GH4ynbW0j8P",
+
+        .session.protocol_ver = MQTT_PROTOCOL_V_3_1_1,
+        .session.keepalive = 15,
+        .session.disable_clean_session = true,
+
+        .network.timeout_ms = 5000,
+        .network.reconnect_timeout_ms = 1000,
+        .network.disable_auto_reconnect = false,
+
+        .buffer.size = 4096,
+        .buffer.out_size = 4096,
+    };
+
+    mqtt_client = esp_mqtt_client_init(&mqtt_cfg);
+
+    esp_mqtt_client_register_event(
+        mqtt_client,
+        ESP_EVENT_ANY_ID,
+        mqtt_event_handler,
+        NULL);
+
+    esp_mqtt_client_start(mqtt_client);
+
+    ESP_LOGI(TAG, "MQTT Started");
+}
+
+void app_main(void)
+{
+    printf("HaLow MQTT Gateway\n");
+
+    app_wlan_init();
+    app_wlan_start();
+    
+    ESP_LOGI(TAG, "Waiting for HaLow network...");
+    
+    vTaskDelay(pdMS_TO_TICKS(25000));
+
+    mqtt_app_start();
+
+    uart_init();
+    mqtt_queue = xQueueCreate(200, sizeof(mqtt_msg_t));
+        
+    xTaskCreatePinnedToCore(
+    uart_task,
+    "uart_task",
+    8192,
+    NULL,
+    10,
+    NULL,
+    1);
+
+    xTaskCreatePinnedToCore(
+    mqtt_publish_task,
+    "mqtt_publish_task",
+    8192,
+    NULL,
+    9,
+    NULL,
+    1);
+}
+
+
+
+2MQTT working Final
+
+
+
+#include <string.h>
+#include "mmosal.h"
+#include "mmwlan.h"
+#include "mmipal.h"
+
+#include "mm_app_common.h"
+
+#include <esp_system.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "driver/gpio.h"
+#include "esp_log.h"
+#include "esp_timer.h"
+#include "mqtt_client.h"
+#include "driver/uart.h"
+
+#define UART_PORT      UART_NUM_1
+#define UART_RX_PIN    44
+#define UART_BUF_SIZE  8192
+
+extern const uint8_t root_ca1_pem_start[] asm("_binary_root_ca1_pem_start");
+extern const uint8_t root_ca1_pem_end[]   asm("_binary_root_ca1_pem_end");
+
+extern const uint8_t certificate_pem_crt_start[] asm("_binary_certificate_pem_crt_start");
+extern const uint8_t certificate_pem_crt_end[]   asm("_binary_certificate_pem_crt_end");
+
+extern const uint8_t private_pem_key_start[] asm("_binary_private_pem_key_start");
+extern const uint8_t private_pem_key_end[]   asm("_binary_private_pem_key_end");
+
+static bool mqtt1_connected = false;
+static bool mqtt2_connected = false;
+
+static esp_mqtt_client_handle_t mqtt_client1;
+static esp_mqtt_client_handle_t mqtt_client2;
+
+static const char *TAG = "HALOW_MQTT";
+
+static QueueHandle_t mqtt_queue;
+
+typedef struct
+{
+    char data[512];
+} mqtt_msg_t;
+
+void uart_init(void)
+{
+    uart_config_t uart_config = {
+        .baud_rate = 115200,
+        .data_bits = UART_DATA_8_BITS,
+        .parity    = UART_PARITY_DISABLE,
+        .stop_bits = UART_STOP_BITS_1,
+        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
+        .source_clk = UART_SCLK_DEFAULT,
+    };
+
+    uart_driver_install(
+        UART_PORT,
+        UART_BUF_SIZE,
+        0,
+        0,
+        NULL,
+        0);
+
+    uart_param_config(UART_PORT, &uart_config);
+
+    uart_set_pin(
+      UART_PORT,
+      UART_PIN_NO_CHANGE,
+      UART_RX_PIN,
+      UART_PIN_NO_CHANGE,
+      UART_PIN_NO_CHANGE);
+
+    ESP_LOGI(TAG, "UART Initialized");
+}
+
+void uart_task(void *pvParameters)
+{
+    uint8_t rx_buffer[512];
+
+    static char line_buffer[768];
+    int line_index = 0;
+    memset(line_buffer, 0, sizeof(line_buffer));
+
+    while (1)
+    {
+        int len = uart_read_bytes(
+            UART_PORT,
+            rx_buffer,
+            sizeof(rx_buffer),
+            pdMS_TO_TICKS(20));
+
+        if (len > 0)
+        {
+            for (int i = 0; i < len; i++)
+            {
+                char ch = rx_buffer[i];
+
+                if (ch == '\r')
+                    continue;
+
+                if (ch == '\n')
+                {
+                    line_buffer[line_index] = '\0';
+
+                    if (line_index > 0)
+                    {
+                      mqtt_msg_t msg;
+
+                      strncpy(
+                          msg.data,
+                          line_buffer,
+                          sizeof(msg.data) - 1);
+
+                      msg.data[sizeof(msg.data) - 1] = '\0';
+
+                      if (xQueueSend(mqtt_queue, &msg, 0) != pdTRUE)
+                      {
+                          mqtt_msg_t temp;
+
+                          // remove oldest packet
+                          xQueueReceive(mqtt_queue, &temp, 0);
+
+                          // insert newest packet
+                          xQueueSend(mqtt_queue, &msg, 0);
+                      }
+                    }
+
+                    line_index = 0;
+                }
+                else
+                {
+                    if (line_index < sizeof(line_buffer) - 1)
+                    {
+                        line_buffer[line_index++] = ch;
+                    }
+                    else
+                    {
+                        // overflow reset
+                        line_index = 0;
+                    }
+                }
+            }
+        }
+    }
+}
+
+static void mqtt_event_handler(void *handler_args,
+                               esp_event_base_t base,
+                               int32_t event_id,
+                               void *event_data)
+{
+    esp_mqtt_event_handle_t event = event_data;
+
+    if (event->client == mqtt_client1)
+    {
+        switch ((esp_mqtt_event_id_t)event_id)
+        {
+            case MQTT_EVENT_CONNECTED:
+                mqtt1_connected = true;
+                ESP_LOGI(TAG, "MQTT1 CONNECTED");
+                break;
+
+            case MQTT_EVENT_DISCONNECTED:
+                mqtt1_connected = false;
+                ESP_LOGW(TAG, "MQTT1 DISCONNECTED");
+                break;
+
+            default:
+                break;
+        }
+    }
+
+    if (event->client == mqtt_client2)
+    {
+        switch ((esp_mqtt_event_id_t)event_id)
+        {
+            case MQTT_EVENT_CONNECTED:
+                mqtt2_connected = true;
+                ESP_LOGI(TAG, "MQTT2 CONNECTED");
+                break;
+
+            case MQTT_EVENT_DISCONNECTED:
+                mqtt2_connected = false;
+                ESP_LOGW(TAG, "MQTT2 DISCONNECTED");
+                break;
+
+            default:
+                break;
+        }
+    }
+}
+
+void mqtt_publish_task(void *pvParameters)
+{
+    mqtt_msg_t msg;
+    mqtt_msg_t temp;
+
+    while (1)
+    {
+        // wait until MQTT reconnects
+        if (!mqtt1_connected && !mqtt2_connected)
+        {
+            vTaskDelay(pdMS_TO_TICKS(500));
+            continue;
+        }
+
+        // get next UART packet
+        if (xQueueReceive(
+                mqtt_queue,
+                &msg,
+                pdMS_TO_TICKS(100)))
+        {
+            // publish to MQTT
+            if (mqtt1_connected)
+            {
+                int id = esp_mqtt_client_enqueue(
+                  mqtt_client1,
+                  "/Galore/asset_tracking/send",
+                  msg.data,
+                  0,
+                  1,
+                  0,
+                  true);
+
+                if (id < 0)
+                {
+                    ESP_LOGW(TAG, "MQTT1 publish failed");
+                }
+                vTaskDelay(pdMS_TO_TICKS(10));
+            }
+
+            if (mqtt2_connected)
+            {
+                int id = esp_mqtt_client_enqueue(
+                  mqtt_client2,
+                  "v1/devices/me/telemetry",
+                  msg.data,
+                  0,
+                  0,
+                  0,
+                  true);
+
+                if (id < 0)
+                {
+                    ESP_LOGW(TAG, "MQTT2 publish failed");
+                }
+                vTaskDelay(pdMS_TO_TICKS(10));
+            }
+
+            // IMPORTANT:
+            // limit MQTT publish rate
+            // prevents socket overload + ping timeout
+            vTaskDelay(pdMS_TO_TICKS(5));
+        }
+    }
+}
+
+void mqtt_app_start(void)
+{
+    esp_mqtt_client_config_t mqtt_cfg1 = {
+       .broker.address.uri =
+          "mqtts://a8v63wr7decrf-ats.iot.ap-south-1.amazonaws.com:8883",
+
+      .broker.verification.certificate =
+          (const char *)root_ca1_pem_start,
+
+      .credentials.authentication.certificate =
+          (const char *)certificate_pem_crt_start,
+
+      .credentials.authentication.key =
+          (const char *)private_pem_key_start,
+
+      .session.protocol_ver = MQTT_PROTOCOL_V_3_1_1,
+      .session.keepalive = 60,
+
+      .network.timeout_ms = 20000,
+      .network.reconnect_timeout_ms = 1000,
+      .session.disable_clean_session = true,
+      .task.stack_size = 8192,
+
+      .buffer.size = 4096,
+      .buffer.out_size = 4096,
+    };
+
+    esp_mqtt_client_config_t mqtt_cfg2 = {
+        .broker.address.uri = "mqtt://209.38.121.193:1381",
+
+        //.credentials.username = "FacMi0c16GH4ynbW0j8P",
+
+        .session.protocol_ver = MQTT_PROTOCOL_V_3_1_1,
+        .session.keepalive = 60,
+
+        .network.timeout_ms = 20000,
+        .network.reconnect_timeout_ms = 1000,
+        .session.disable_clean_session = true,
+        .task.stack_size = 8192,
+
+        .buffer.size = 4096,
+        .buffer.out_size = 4096,
+    };
+
+    mqtt_client1 = esp_mqtt_client_init(&mqtt_cfg1);
+    mqtt_client2 = esp_mqtt_client_init(&mqtt_cfg2);
+
+    esp_mqtt_client_register_event(
+        mqtt_client1,
+        ESP_EVENT_ANY_ID,
+        mqtt_event_handler,
+        NULL);
+
+    esp_mqtt_client_register_event(
+        mqtt_client2,
+        ESP_EVENT_ANY_ID,
+        mqtt_event_handler,
+        NULL);
+
+    esp_mqtt_client_start(mqtt_client1);
+    esp_mqtt_client_start(mqtt_client2);
+
+    ESP_LOGI(TAG, "Both MQTT clients started");
+}
+
+void app_main(void)
+{
+    printf("HaLow MQTT Gateway\n");
+
+    app_wlan_init();
+    app_wlan_start();
+
+    ESP_LOGI(TAG, "Waiting for HaLow network...");
+
+    vTaskDelay(pdMS_TO_TICKS(25000));
+
+    // CREATE QUEUE FIRST
+    mqtt_queue = xQueueCreate(150, sizeof(mqtt_msg_t));
+
+    if (mqtt_queue == NULL)
+    {
+        ESP_LOGE(TAG, "Failed to create MQTT queue");
+        return;
+    }
+
+    uart_init();
+
+    mqtt_app_start();
+
+    xTaskCreatePinnedToCore(
+        uart_task,
+        "uart_task",
+        8192,
+        NULL,
+        10,
+        NULL,
+        1);
+
+    xTaskCreatePinnedToCore(
+        mqtt_publish_task,
+        "mqtt_publish_task",
+        8192,
+        NULL,
+        9,
+        NULL,
+        1);
+}
