@@ -1,0 +1,1019 @@
+EC200U ESP32S3 BLE PAIR DATA TO MQTT VIA LTE WORKING
+
+// ===============================================================
+//  ESP32-S3 + EC200U-CN
+//  BLE Frontier + GNSS + MQTT + Web (NON BLOCKING)
+// ===============================================================
+
+#include <WiFi.h>
+#include <WebServer.h>
+#include <Preferences.h>
+#include <ArduinoBLE.h>
+#include <ArduinoJson.h>
+
+// ---------------- MODEM UART ----------------
+#define RXD1 18
+#define TXD1 17
+#define MODEM_PWRKEY 10
+HardwareSerial modemSerial(1);
+HardwareSerial mesh(2);
+
+// ---------------- WIFI AP -------------------
+const char* ssid = "Vital Monitor-2";
+const char* password = "12345678";
+
+WebServer server(80);
+Preferences preferences;
+
+// ---------------- MQTT CONFIG ----------------
+const char mqttServer[] = "209.38.121.193";
+const int  mqttPort     = 1381;
+const char mqttUser[]   = "";
+const char mqttPassword[] = "";
+const char mqttTopic[]  = "mesh/topic";
+String mqttClientId;
+
+bool mqttConnected = false;
+unsigned long lastMqttOk = 0;
+unsigned long lastReconnectAttempt = 0;
+
+// -------- WEB LOG BUFFER --------
+#define LOG_LINES 120
+
+String logBuffer[LOG_LINES];
+int logIndex = 0;
+
+void webLog(const String &s){
+  logBuffer[logIndex] = s;
+  logIndex = (logIndex + 1) % LOG_LINES;
+}
+
+// helper to print BOTH serial + web
+void LOG(const String &s){
+  Serial.println(s);
+  webLog(s);
+}
+
+// ===============================================================
+// DATA MODEL
+// ===============================================================
+struct SystemData {
+  String id = "002";
+
+  bool bleValid = false;
+  uint16_t HR = 0;
+  uint8_t B = 0;
+  String CC1="0", CC2="N/A", CC3="0";
+
+  bool gnssValid = false;
+  double Lat=0, Lon=0;
+  float Acc=0;
+
+  unsigned long lastGnssUpdate = 0;  
+  unsigned long lastBleUpdate=0;
+};
+
+SystemData data;
+SemaphoreHandle_t dataMutex;
+SemaphoreHandle_t modemMutex;
+
+// ---------------- BLE ----------------
+BLEDevice connectedPeripheral;
+String savedDeviceAddr = "";
+String savedDeviceName = "";
+String savedDeviceNick = "";
+bool autoReconnect=false;
+
+// ---------------- TIMING ----------------
+uint32_t sendInterval = 5;
+unsigned long lastSendTime=0;
+unsigned long lastServiceReceived=0;
+
+// =====================================================
+// EXACT BLE LOGIC FROM YOUR ORIGINAL - PRESERVED
+// =====================================================
+
+String toHexString(const unsigned char* data, int length) {
+  String hexStr="";
+  for(int i=0;i<length;i++){
+    if(data[i]<16) hexStr+="0";
+    hexStr+=String(data[i],HEX);
+  }
+  hexStr.toUpperCase();
+  return hexStr;
+}
+
+// ---- SAFE BUFFERS ----
+uint8_t rawCC3[64];
+uint8_t rawHR[4];
+int rawCC3Len=0;
+int rawHRLen=0;
+
+void onCustomChar3Notify(BLEDevice, BLECharacteristic c){
+  rawCC3Len = c.valueLength();
+  if(rawCC3Len > 64) rawCC3Len=64;
+  memcpy(rawCC3, c.value(), rawCC3Len);
+  lastServiceReceived = millis();
+}
+
+void onHeartRateNotify(BLEDevice, BLECharacteristic c){
+  rawHRLen = c.valueLength();
+  if(rawHRLen > 4) rawHRLen=4;
+  memcpy(rawHR, c.value(), rawHRLen);
+  lastServiceReceived = millis();
+}
+
+void setECGStreaming(BLEDevice p){
+
+  BLECharacteristic cmd=
+    p.characteristic("9f154f02-2020-11e6-8749-0002a5d5c51b");
+
+  if(!cmd) return;
+
+  uint8_t c[2]={0x30,0x80};
+  cmd.writeValue(c,2,false);
+}
+
+// -----------------------------------------------------
+
+bool setupPeripheral(BLEDevice p){
+
+  if(!p.connect()) return false;
+  if(!p.discoverAttributes()) return false;
+
+  BLECharacteristic c3=
+    p.characteristic("9f154f03-2020-11e6-8749-0002a5d5c51b");
+
+  if(c3){
+    c3.subscribe();
+    c3.setEventHandler(BLECharacteristicEvent::BLEUpdated,
+                       onCustomChar3Notify);
+  }
+
+  BLECharacteristic hr=
+    p.characteristic("2a37");
+
+  if(hr){
+    hr.subscribe();
+    hr.setEventHandler(BLECharacteristicEvent::BLEUpdated,
+                       onHeartRateNotify);
+  }
+
+  setECGStreaming(p);
+
+  lastServiceReceived=millis();
+  return true;
+}
+
+// ===============================================================
+//  AT HELPERS (NON BLOCKING STYLE SIMPLIFIED)
+// ===============================================================
+String sendAT(const String& cmd, int timeout=1000) {
+
+  xSemaphoreTake(modemMutex, portMAX_DELAY);
+
+  while(modemSerial.available())
+    modemSerial.read();
+
+  modemSerial.println(cmd);
+
+  unsigned long t = millis();
+  String r;
+
+  while(millis() - t < (unsigned)timeout) {
+
+    while(modemSerial.available()) {
+
+      char c = modemSerial.read();
+      r += c;
+    }
+
+    vTaskDelay(1);
+  }
+
+  xSemaphoreGive(modemMutex);
+
+  return r;
+}
+
+// ===============================================================
+// GNSS PARSE (FROM YOUR CODE ADAPTED)
+// ===============================================================
+String getValue(const String &data, char sep, int index) {
+  int found=0,start=0;
+  for(int i=0;i<data.length();i++){
+    if(data[i]==sep||i==data.length()-1){
+      if(found==index)
+        return data.substring(start,i==data.length()-1?i+1:i);
+      found++; start=i+1;
+    }
+  }
+  return "";
+}
+
+void parseGNSS(const String& r) {
+
+  int p=r.indexOf("+QGPSLOC:");
+  if(p<0) return;
+
+  p=r.indexOf(':',p);
+  if(p<0) return;
+
+  String d=r.substring(p+1);
+  d.trim();
+
+  String lat=getValue(d,',',1);
+  String lon=getValue(d,',',2);
+  String acc=getValue(d,',',3);
+
+  if(lat.length()&&lon.length()) {
+
+    xSemaphoreTake(dataMutex,portMAX_DELAY);
+
+    data.Lat=lat.toDouble();
+    data.Lon=lon.toDouble();
+    data.Acc=acc.toFloat();
+    data.gnssValid= true;
+    data.lastGnssUpdate = millis(); 
+
+    xSemaphoreGive(dataMutex);
+  }
+}
+
+// ===============================================================
+// GNSS TASK
+// ===============================================================
+void gnssTask(void*){
+  sendAT("AT");
+  sendAT("ATE0");
+
+  // IMPORTANT: stop streaming
+  sendAT("AT+QGPSCFG=\"outport\",\"none\"",1000);
+
+  sendAT("AT+QGPSEND",1000);
+
+  sendAT("AT+QAGPSCFG=1,\"http://quectel-api1.rx-networks.cn/rxn-api/locationApi/rtcm\",\"wLgWwv6JQt\",\"Quectel\",\"aFltUERDZzZxeTY5cEp2eA==\",1,\"airtelgprs.com\"",5000);
+  sendAT("AT+QAGPS=1");
+
+  // start GPS only
+  sendAT("AT+QGPS=1",1000);
+
+  vTaskDelay(20000/portTICK_PERIOD_MS);
+
+  for(;;){
+    String r = sendAT("AT+QGPSLOC=2",800);
+    parseGNSS(r);
+    vTaskDelay(10000/portTICK_PERIOD_MS);
+  }
+}
+
+// ===============================================================
+// MQTT PUBLISH
+// ===============================================================
+
+bool modemNetworkReady(){
+
+  String r;
+
+  r = sendAT("AT+CGPADDR=1", 500);
+
+  if(r.indexOf(".") >= 0)
+    return true;
+
+  return false;
+}
+
+void mqttInit(){
+  LOG("[MQTT] Initializing session");
+
+  // cleanup stale sockets only if needed
+  sendAT("AT+QMTCLOSE=0",500);
+
+  // ---- WAIT FOR NETWORK ----
+  for(int i=0;i<3;i++){
+    if(modemNetworkReady()) break;
+    LOG("[MQTT] waiting for network...");
+    delay(1000);
+  }
+
+  //sendAT("AT+QMTDISC=0", 2000);
+  sendAT("AT+QIACT=1",5000);
+
+  String r;
+
+  sendAT("AT+QMTCFG=\"keepalive\",0,120",1000);
+
+  r = sendAT(
+    String("AT+QMTOPEN=0,\"") +
+    mqttServer + "\"," + mqttPort,
+    5000
+  );
+
+  if(r.indexOf("+QMTOPEN: 0,0") == -1){
+
+    mqttConnected = false;
+    LOG("[MQTT] open failed");
+    return;
+  }
+
+  r = sendAT(
+    String("AT+QMTCONN=0,\"") +
+    mqttClientId +
+    "\",\"" +
+    mqttUser +
+    "\",\"" +
+    mqttPassword +
+    "\"",
+    6000
+  );
+
+  if(r.indexOf("+QMTCONN: 0,0,0") != -1){
+    mqttConnected = true;
+    lastMqttOk = millis();
+    LOG("[MQTT] Connected");
+  }else{
+    mqttConnected = false;
+    LOG("[MQTT] Connect failed");
+  }
+}
+
+void mqttPublish(const String& payload){
+
+  if(!mqttConnected){
+
+    if(millis() - lastReconnectAttempt > 3000){
+
+      lastReconnectAttempt = millis();
+      mqttInit();
+    }
+
+    if(!mqttConnected){
+      LOG("[MQTT] reconnect failed");
+      return;
+    }
+  }
+
+  xSemaphoreTake(modemMutex, portMAX_DELAY);
+
+  while(modemSerial.available())
+    modemSerial.read();
+
+  modemSerial.print("AT+QMTPUB=0,0,0,0,\"");
+  modemSerial.print(mqttTopic);
+  modemSerial.println("\"");
+
+  delay(100);
+
+  modemSerial.print(payload);
+  modemSerial.write(0x1A);
+
+  String r;
+  unsigned long t = millis();
+
+  while(millis() - t < 7000){
+
+    while(modemSerial.available()){
+
+      char c = modemSerial.read();
+      r += c;
+
+      // REAL SUCCESS URC
+      if(r.indexOf("+QMTPUB: 0,0,0") != -1){
+
+        mqttConnected = true;
+
+        xSemaphoreGive(modemMutex);
+
+        LOG("[MQTT] " + payload);
+        return;
+      }
+
+      // modem/broker error
+      if(r.indexOf("ERROR") != -1){
+
+        mqttConnected = false;
+
+        xSemaphoreGive(modemMutex);
+
+        LOG("[MQTT] publish failed");
+        return;
+      }
+    }
+
+    vTaskDelay(1);
+  }
+
+  xSemaphoreGive(modemMutex);
+
+  // IMPORTANT:
+  // timeout != disconnect
+  LOG("[MQTT] publish timeout");
+}
+
+// ===============================================================
+// PUBLISH TASK
+// ===============================================================
+void publishTask(void*){
+
+  StaticJsonDocument<512> doc;
+
+  mqttInit();
+  vTaskDelay(2000/portTICK_PERIOD_MS);
+
+  for(;;){
+
+    if(millis()-lastSendTime >= sendInterval*1000UL){
+
+      xSemaphoreTake(dataMutex,portMAX_DELAY);
+
+      doc.clear();
+      doc["id"]=data.id;
+
+      if(data.bleValid){
+        doc["B"]=data.B;
+        doc["HR"]=data.HR;
+        doc["CC1"]=data.CC1;
+        doc["CC2"]=data.CC2;
+        doc["CC3"]=data.CC3;
+      }
+
+      // ---- GNSS MERGE ONLY IF FRESH ----
+      if(data.gnssValid) {
+        doc["Lat"] = data.Lat;
+        doc["Lon"] = data.Lon;
+        doc["Acc"] = data.Acc;
+
+        // immediately consume the fix
+        data.gnssValid = false;
+      }
+
+      xSemaphoreGive(dataMutex);
+
+      String out;
+      serializeJson(doc,out);
+      mesh.println(out);
+      LOG("[MESH] " + out);
+
+      mqttPublish(out);
+
+      //LOG("[MQTT] "+out);
+
+      lastSendTime=millis();
+    }
+
+    vTaskDelay(200/portTICK_PERIOD_MS);
+  }
+}
+
+// ===============================================================
+// BLE TASK  (Your logic preserved)
+// ===============================================================
+void vbleTask(void*){
+
+  // ---------- INIT ----------
+  if (!BLE.begin()) {
+    LOG("[BLE] Start failed!");
+    vTaskDelete(NULL);
+  }
+
+  LOG("[BLE] Central ready");
+
+  unsigned long lastScanAttempt = 0;
+  bool wasConnected = false;
+
+  for(;;){
+
+    BLE.poll();
+
+    // =====================================================
+    // 1) HANDLE DISCONNECT
+    // =====================================================
+    if (connectedPeripheral.connected() == false && wasConnected) {
+      LOG("[BLE] Disconnected from device");
+
+      connectedPeripheral = BLEDevice();
+
+      autoReconnect = true;
+      wasConnected = false;
+    }
+
+    // =====================================================
+    // 2) RECONNECT STATE MACHINE (NON BLOCKING)
+    // =====================================================
+    if (!connectedPeripheral && autoReconnect) {
+
+      // try every 8 seconds
+      if (millis() - lastScanAttempt > 8000) {
+
+        lastScanAttempt = millis();
+
+        LOG("[BLE] Scanning for: " + savedDeviceAddr);
+
+        BLE.scan();
+
+        unsigned long s = millis();
+        while (millis() - s < 4000) {
+
+          BLEDevice d = BLE.available();
+
+          if (d && String(d.address().c_str()) == savedDeviceAddr) {
+
+            BLE.stopScan();
+
+            LOG("[BLE] Found saved device");
+
+            if (setupPeripheral(d)) {
+              connectedPeripheral = d;
+              autoReconnect = false;
+              wasConnected = true;
+              LOG("[BLE] Connected & setup OK");
+            } else {
+              LOG("[BLE] Setup failed");
+            }
+            break;
+          }
+          vTaskDelay(20);
+        }
+
+        BLE.stopScan();
+      }
+    }
+
+    // =====================================================
+    // 3) PROCESS NOTIFY BUFFERS (SAFE ZONE)
+    // =====================================================
+    if (rawCC3Len > 0) {
+      xSemaphoreTake(dataMutex, portMAX_DELAY);
+
+      data.CC3 = "0x" + toHexString(rawCC3, rawCC3Len);
+      data.bleValid = true;
+
+      rawCC3Len = 0;
+
+      xSemaphoreGive(dataMutex);
+    }
+
+    if (rawHRLen >= 2) {
+
+      uint8_t flags = rawHR[0];
+      uint16_t hr = (flags & 0x01 && rawHRLen >= 3) ?
+                     (rawHR[1] | (rawHR[2] << 8)) : rawHR[1];
+
+      xSemaphoreTake(dataMutex, portMAX_DELAY);
+
+      data.HR = hr;
+      data.bleValid = true;
+
+      rawHRLen = 0;
+
+      xSemaphoreGive(dataMutex);
+    }
+
+    // =====================================================
+    // 4) WATCHDOG ONLY WHEN EVER CONNECTED
+    // =====================================================
+    if (wasConnected &&
+        millis() - lastServiceReceived > 12000) {
+
+      LOG("[BLE] Watchdog timeout - reconnecting");
+
+      if (connectedPeripheral.connected()) {
+        connectedPeripheral.disconnect();
+      }
+
+      connectedPeripheral = BLEDevice();
+      autoReconnect = true;
+      wasConnected = false;
+    }
+
+    // =====================================================
+    // 5) POLL STATIC CHARACTERISTICS
+    // =====================================================
+    if (connectedPeripheral &&
+        connectedPeripheral.connected()) {
+
+      BLECharacteristic c1 = connectedPeripheral.characteristic("9f154f01-2020-11e6-8749-0002a5d5c51b");
+      BLECharacteristic batt = connectedPeripheral.characteristic("2a19");
+
+      xSemaphoreTake(dataMutex, portMAX_DELAY);
+
+      if (c1 && c1.canRead() && c1.read()) {
+        data.CC1 = "0x" +
+          toHexString(c1.value(), c1.valueLength());
+      }
+
+      if (batt && batt.canRead() && batt.read()) {
+        data.B = batt.value()[0];
+      }
+
+      data.CC2 = "N/A";
+
+      xSemaphoreGive(dataMutex);
+    }
+
+    vTaskDelay(50);
+  }
+}
+
+// ===============================================================
+// WEB TASK (core0) – same as your UI
+// ===============================================================
+void webTask(void*){
+  for(;;){
+    server.handleClient();
+    vTaskDelay(10);
+  }
+}
+
+// ==== Modern Web UI ====
+String getHTMLPage() {
+  String page = R"rawliteral(
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ESP32 BLE Control</title>
+<style>
+  /* Animated Gradient Background */
+  body {
+    font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+    margin: 0;
+    min-height: 100vh;
+    display: flex;
+    justify-content: center;
+    align-items: flex-start;
+    padding: 20px;
+    background: linear-gradient(-45deg, #1e1e1e, #121212, #1e1e1e, #292929);
+    background-size: 400% 400%;
+    animation: gradientBG 15s ease infinite;
+    color: #eee;
+  }
+  @keyframes gradientBG {
+    0% {background-position:0% 50%;}
+    50% {background-position:100% 50%;}
+    100% {background-position:0% 50%;}
+  }
+
+  /* Card Style with Smooth Entrance */
+  .card {
+    background: rgba(30,30,30,0.95);
+    padding: 25px;
+    border-radius: 20px;
+    box-shadow: 0 8px 25px rgba(0,0,0,0.7);
+    max-width: 480px;
+    width: 100%;
+    text-align: center;
+    animation: cardFade 0.8s ease forwards;
+    transform: translateY(20px);
+    opacity: 0;
+  }
+  @keyframes cardFade {
+    to { transform: translateY(0); opacity: 1; }
+  }
+
+  h2 { color: #4fc3f7; margin-bottom: 12px; }
+  
+  button {
+    background: #4fc3f7;
+    color: #121212;
+    border: none;
+    padding: 14px 22px;
+    margin: 10px 5px;
+    border-radius: 14px;
+    font-size: 16px;
+    cursor: pointer;
+    transition: all 0.3s ease;
+    box-shadow: 0 5px 15px rgba(0,0,0,0.5);
+  }
+  button:hover {
+    background: #0288d1;
+    transform: translateY(-3px) scale(1.05);
+  }
+
+  #devices {
+    margin-top: 20px;
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    animation: fadeIn 1s ease;
+  }
+  .device-btn {
+    background: #00bfa5;
+    color: #fff;
+    border-radius: 14px;
+    padding: 14px;
+    font-size: 14px;
+    transition: all 0.3s ease;
+    box-shadow: 0 3px 12px rgba(0,0,0,0.4);
+    text-align: left;
+  }
+  .device-btn:hover {
+    background: #008e76;
+    transform: scale(1.02);
+  }
+
+  .saved-line { display:flex; justify-content:center; align-items:center; gap:8px; flex-wrap:wrap; }
+  .pen { cursor:pointer; font-size:18px; color:#fff; padding:6px; border-radius:6px; background:#2b2b2b; box-shadow:0 2px 8px rgba(0,0,0,0.4); }
+  .pen:hover { background:#3a3a3a; transform:translateY(-2px); }
+
+  @keyframes fadeIn {
+    from { opacity: 0; transform: translateY(10px);}
+    to { opacity: 1; transform: translateY(0);}
+  }
+
+  #loading {
+    display: none;
+    margin-top: 15px;
+    color: #fff;
+  }
+  .spinner {
+    border: 4px solid #f3f3f3;
+    border-top: 4px solid #4fc3f7;
+    border-radius: 50%;
+    width: 35px;
+    height: 35px;
+    animation: spin 1s linear infinite;
+    margin: 0 auto 8px;
+  }
+  @keyframes spin {
+    0% { transform: rotate(0deg);}
+    100% { transform: rotate(360deg);}
+  }
+
+  /* Responsive */
+  @media (max-width: 500px) {
+    .card { padding: 20px; }
+    button { padding: 12px 18px; font-size: 14px; }
+    .device-btn { padding: 12px; font-size: 13px; }
+  }
+</style>
+</head>
+<body>
+<div class="card">
+<h2>ESP32 BLE Control</h2>
+<p>Saved Device:</p>
+<div class="saved-line">
+<strong><span id="savedDevice">)rawliteral";
+
+  // Compose displayed saved device (nick or name + addr)
+  String displaySaved = "None";
+  if (savedDeviceAddr.length()) {
+    if (savedDeviceNick.length()) {
+      displaySaved = savedDeviceNick + " (" + (savedDeviceName.length() ? savedDeviceName : "Unknown") + " / " + savedDeviceAddr + ")";
+    } else {
+      displaySaved = (savedDeviceName.length() ? savedDeviceName : "Unknown") + " (" + savedDeviceAddr + ")";
+    }
+  }
+  page += displaySaved;
+  page += R"rawliteral(</span></strong>
+<span class="pen" title="Edit nickname" onclick="editNick()">✏️</span>
+</div>
+<button onclick="scanDevices()">🔍 Scan Devices</button>
+<button onclick="clearDevice()">♻ Re-Pair</button>
+<button onclick="fetch('/reboot').then(()=>alert('Rebooting...'))">🔄 Reset</button>
+<p id="intervalText">Time interval set at )rawliteral";
+page += String(sendInterval);
+page += R"rawliteral( seconds</p>
+<input type="number" id="intervalInput" value=")rawliteral";
+page += String(sendInterval);
+page += R"rawliteral(" min="1" style="padding:8px; border-radius:8px; width:80px; text-align:center;">
+<button onclick="setInterval()">💾 Save Interval</button>
+
+<div id="loading"><div class="spinner"></div><p>Scanning...</p></div>
+<div id="devices"></div>
+</div>
+<script>
+function scanDevices() {
+  document.getElementById('loading').style.display = 'block';
+  document.getElementById('devices').innerHTML = '';
+  fetch('/scan').then(r=>r.json()).then(devices=>{
+    document.getElementById('loading').style.display = 'none';
+    let html = '';
+    devices.forEach(d=>{
+      // d.name and d.addr
+      const safeName = d.name || 'Unknown';
+      html += `<button class="device-btn" onclick="selectDevice('${d.addr}','${safeName.replace(/'/g,'\\\'').replace(/"/g,'\\\"')}')">${safeName} — ${d.addr}</button>`;
+    });
+    if(devices.length === 0) html = '<p>No Frontier BLE devices found.</p>';
+    document.getElementById('devices').innerHTML = html;
+  }).catch(err=>{
+    document.getElementById('loading').style.display = 'none';
+    document.getElementById('devices').innerHTML = '<p style="color:red;">Scan failed.</p>';
+  });
+}
+function selectDevice(addr, name) {
+  // include name when saving
+  fetch('/select?addr='+encodeURIComponent(addr)+'&name='+encodeURIComponent(name)).then(r=>r.text()).then(res=>{
+    alert(res);
+    location.reload();
+  });
+}
+function setInterval() {
+  const sec = document.getElementById('intervalInput').value;
+  fetch('/setInterval?sec='+sec).then(r=>r.text()).then(res=>{
+    alert(res);
+    document.getElementById('intervalText').innerText = "Time interval set at " + sec + " seconds";
+  });
+}
+function clearDevice() {
+  fetch('/clear').then(r=>r.text()).then(res=>{
+    alert(res);
+    location.reload();
+  });
+}
+function editNick() {
+  // If no saved device, ask to pair first
+  const saved = document.getElementById('savedDevice').innerText;
+  if (!saved || saved === 'None') {
+    alert('No saved device to nickname. Please pair first.');
+    return;
+  }
+  const nick = prompt('Enter a short nickname for this device:');
+  if (nick === null) return; // cancelled
+  // send to server
+  const addrMatch = saved.match(/([0-9A-Fa-f:]{17})/);
+  if (!addrMatch) {
+    alert('Could not determine saved device address. Re-pair and try again.');
+    return;
+  }
+  const addr = addrMatch[0];
+  fetch('/setnick?addr='+encodeURIComponent(addr)+'&nick='+encodeURIComponent(nick)).then(r=>r.text()).then(res=>{
+    alert(res);
+    location.reload();
+  });
+}
+</script>
+</body>
+</html>
+)rawliteral";
+  return page;
+}
+
+// ==== Web Routes ====
+void handleRoot() { server.send(200, "text/html", getHTMLPage()); }
+
+// ==== Reboot Handler ====
+void handleReboot() {
+  server.send(200, "text/plain", "ESP32 is rebooting...");
+  delay(500);
+  ESP.restart();
+}
+
+// ==== Scan: return only devices whose name starts with "Frontier" ====
+void handleScan() {
+  BLE.scan();
+  delay(3000);
+  String json = "[";
+  while (BLE.available()) {
+    BLEDevice d = BLE.available();
+    String nm = String(d.localName().c_str());
+    if (nm.length() && nm.startsWith("Frontier")) {
+      json += "{\"name\":\"" + nm +
+              "\",\"addr\":\"" + String(d.address().c_str()) + "\"},";
+    }
+  }
+  if (json.endsWith(",")) json.remove(json.length()-1);
+  json += "]";
+  BLE.stopScan();
+  server.send(200, "application/json", json);
+}
+
+void handleSelect() {
+  if (!server.hasArg("addr")) {
+    server.send(400, "text/plain", "Missing addr"); return;
+  }
+  String addr = server.arg("addr");
+  String name = "";
+  if (server.hasArg("name")) name = server.arg("name");
+
+  savedDeviceAddr = addr;
+  savedDeviceName = name;
+  preferences.putString("ble_addr", savedDeviceAddr);
+  preferences.putString("ble_name", savedDeviceName);
+  // Clear any existing nickname for previous device - keep only one saved device nickname for simplicity
+  // (If you want per-device nicknames, change storage strategy)
+  preferences.putString("ble_nick", preferences.getString("ble_nick", "")); // keep existing nick if any
+  server.send(200, "text/plain", "Device saved: " + savedDeviceName + " (" + savedDeviceAddr + ")");
+  autoReconnect = true;
+  delay(500);
+  ESP.restart();   // 🔄 restart right after selecting a device
+}
+
+void handleClear() {
+  if (connectedPeripheral.connected()) connectedPeripheral.disconnect();
+  preferences.remove("ble_addr");
+  preferences.remove("ble_name");
+  preferences.remove("ble_nick");
+  savedDeviceAddr = "";
+  savedDeviceName = "";
+  savedDeviceNick = "";
+  server.send(200, "text/plain", "Device cleared. Please scan again.");
+}
+
+void handleSetInterval() {
+  if (!server.hasArg("sec")) {
+    server.send(400, "text/plain", "Missing sec"); 
+    return;
+  }
+  sendInterval = server.arg("sec").toInt();
+  if (sendInterval < 1) sendInterval = 1; // minimum 1 second
+  preferences.putUInt("send_interval", sendInterval);
+  server.send(200, "text/plain", "Interval updated: " + String(sendInterval) + " seconds");
+}
+
+void handleSetNick() {
+  if (!server.hasArg("addr") || !server.hasArg("nick")) {
+    server.send(400, "text/plain", "Missing addr or nick"); return;
+  }
+  String addr = server.arg("addr");
+  String nick = server.arg("nick");
+  // Only allow setting nick for currently saved device addr
+  if (addr != savedDeviceAddr) {
+    server.send(400, "text/plain", "Address mismatch with saved device.");
+    return;
+  }
+  savedDeviceNick = nick;
+  preferences.putString("ble_nick", savedDeviceNick);
+  server.send(200, "text/plain", "Nickname saved: " + savedDeviceNick);
+}
+
+void handleLog(){
+
+  String page = R"rawliteral(
+  <html>
+  <head>
+    <meta http-equiv="refresh" content="3">
+    <style>
+      body{background:#111;color:#0f0;font-family:monospace;}
+      pre{white-space:pre-wrap;}
+    </style>
+  </head>
+  <body>
+  <h3>ESP32 LIVE LOG</h3>
+  <pre>
+  )rawliteral";
+
+  // show newest last
+  for(int i=0;i<LOG_LINES;i++){
+    int idx = (logIndex + i) % LOG_LINES;
+    if(logBuffer[idx].length())
+      page += logBuffer[idx] + "\n";
+  }
+
+  page += "</pre></body></html>";
+
+  server.send(200, "text/html", page);
+}
+
+// ===============================================================
+void setup(){
+  Serial.begin(115200);
+  mesh.begin(115200, SERIAL_8N1, 41, 42);
+
+  pinMode(MODEM_PWRKEY, OUTPUT);
+  digitalWrite(MODEM_PWRKEY, LOW);
+  delay(200);
+  digitalWrite(MODEM_PWRKEY, HIGH);
+  delay(1000);
+  digitalWrite(MODEM_PWRKEY, LOW);
+
+  modemSerial.begin(115200,SERIAL_8N1,RXD1,TXD1);
+  mqttClientId = "ESP32_" + String((uint32_t)ESP.getEfuseMac(), HEX);
+
+  delay(8000);
+
+  WiFi.softAP(ssid,password);
+
+  preferences.begin("ble",false);
+  savedDeviceAddr = preferences.getString("ble_addr", "");
+  savedDeviceName = preferences.getString("ble_name", "");
+  savedDeviceNick = preferences.getString("ble_nick", "");
+  sendInterval = preferences.getUInt("send_interval", 5); // default 5s
+
+  // ---- WEB ROUTES (YOUR ORIGINAL) ----
+  server.on("/", handleRoot);
+  server.on("/scan", handleScan);
+  server.on("/select", handleSelect);
+  server.on("/clear", handleClear);
+  server.on("/reboot", handleReboot);
+  server.on("/setnick", handleSetNick);
+  server.on("/setInterval", handleSetInterval);
+  server.on("/log", handleLog);
+  server.begin();
+
+  if(savedDeviceAddr.length()> 0){
+    autoReconnect=true;
+  }
+
+  dataMutex=xSemaphoreCreateMutex();
+  modemMutex = xSemaphoreCreateMutex();
+
+  xTaskCreatePinnedToCore(webTask,"web",8000,NULL,1,NULL,0);
+  xTaskCreatePinnedToCore(vbleTask,"ble",10000,NULL,3,NULL,1);
+  xTaskCreatePinnedToCore(gnssTask,"gnss",8000,NULL,1,NULL,1);
+  xTaskCreatePinnedToCore(publishTask,"pub",9000,NULL,1,NULL,1);
+}
+
+void loop(){}
+
