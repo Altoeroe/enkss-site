@@ -1,4 +1,4 @@
-EC200U ESP32S3 BLE PAIR DATA TO MQTT VIA LTE WORKING
+EC200U ESP32S3 BLE PAIR DATA TO MQTT VIA LTE WORKING + MESH
 
 // ===============================================================
 //  ESP32-S3 + EC200U-CN
